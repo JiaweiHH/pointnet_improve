@@ -28,7 +28,7 @@ def parse_args():
     parser.add_argument('-c', '--checkpoint', type=str, metavar='PATH',
                         help='path to save checkpoint (default: checkpoint)')
     parser.add_argument('--msg', type=str, help='message after checkpoint')
-    parser.add_argument('--batch_size', type=int, default=32, help='batch size in training')
+    parser.add_argument('--batch_size', type=int, default=16, help='batch size in training')
     parser.add_argument('--model', default='PointNet', help='model name [default: pointnet_cls]')
     parser.add_argument('--epoch', default=300, type=int, help='number of epoch in training')
     parser.add_argument('--num_points', type=int, default=1024, help='Point Number')
@@ -36,7 +36,7 @@ def parse_args():
     parser.add_argument('--min_lr', default=0.005, type=float, help='min lr')
     parser.add_argument('--weight_decay', type=float, default=1e-4, help='decay rate')
     parser.add_argument('--seed', type=int, default=1234, help='random seed')
-    parser.add_argument('--workers', default=8, type=int, help='workers')
+    parser.add_argument('--workers', default=12, type=int, help='workers')
     return parser.parse_args()
 
 

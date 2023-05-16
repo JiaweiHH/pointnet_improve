@@ -254,6 +254,113 @@ class PointMixerBlockPaperInterSetLayerGroupMLPv3(PointMixerBlock):
     intraLayer = PointMixerIntraSetLayerPaper
     interLayer = PointMixerInterSetLayerGroupMLPv3
 
+
+##############################################################################################
+class TinyAtten(nn.Module):
+    def __init__(self, in_channels, out_channels, d_attn=64):
+        super(TinyAtten, self).__init__()
+        self.d_attn = d_attn
+        self.conv1 = nn.Conv1d(in_channels, d_attn*3, 1)
+        self.conv2 = nn.Conv1d(d_attn, out_channels, 1)
+
+    def forward(self, x):
+        # x: n, k, d
+        # x = x.permute(0, 2, 1)
+        qkv = self.conv1(x)
+        qkv = qkv.permute(0, 2, 1)  # n, k, d_attn*3
+        q, k, v = qkv.chunk(3, dim=-1)  # n, k, d_attn
+        w = torch.einsum("bnd,bmd->bnm", q, k)
+        a = F.softmax(w * (self.d_attn ** -0.5), dim=-1)
+        x = torch.einsum("bnm,bmd->bnd", a, v)  # n, k, d_attn
+        x = x.permute(0, 2, 1)  # n, d_attn, k
+        x = self.conv2(x)  # n, out_channels, k
+        return x
+
+
+class GAT(nn.Module):
+    def __init__(self, in_channels=3, hidden_channels = 48):
+        super(GAT, self).__init__()
+        self.conv1 = nn.Conv2d(in_channels, hidden_channels, 1)
+        self.conv2 = nn.Conv2d(hidden_channels, 1, 1)
+
+    def forward(self, x, x_coordinates):
+        # n, k, 3 = x_coordinates.shape
+        x_expand_1 = x_coordinates.unsqueeze(1)
+        x_expand_2 = x_coordinates.unsqueeze(2)
+        diff = x_expand_1 - x_expand_2  # n, k, k, 3
+        diff = diff.permute(0, 3, 2, 1)
+        diff = F.leaky_relu(self.conv1(diff))
+        diff = self.conv2(diff)
+        diff = diff.permute(0, 3, 2, 1)  # n, k, k, c
+        weights = diff.squeeze(-1)  # n, k, k
+        attention = F.softmax(weights, dim=-1)
+        output = torch.matmul(attention, x)  # n, k, c
+
+        return output
+
+
+class PointAMLPBlock(nn.Module):
+    def __init__(self, in_planes, out_planes, nsample=16, share_planes=2):
+        super().__init__()
+        self.nsample = nsample
+        d_ffn = out_planes // share_planes
+        self.d_ffn = d_ffn
+        # AMLP 之前的线性层
+        self.aMLPs_1 = nn.Sequential(
+            nn.Linear(3+in_planes, out_planes),
+            nn.LeakyReLU(inplace=True),
+            BilinearFeedForward(out_planes, out_planes, out_planes)
+        )
+
+        self.aMLPs_2 = nn.Sequential(
+            nn.Conv1d(in_planes, d_ffn, 1),
+            nn.BatchNorm1d(d_ffn),
+            nn.LeakyReLU(inplace=True)
+        )
+
+        self.layer_norm = nn.LayerNorm(d_ffn//2)
+        self.gat = GAT()
+        self.linear = nn.Linear(d_ffn//2, d_ffn//2)
+
+        self.tiny_attn = TinyAtten(d_ffn, d_ffn//2)
+        
+        self.aMLPs_3 = nn.Sequential(
+            nn.Conv1d(d_ffn//2, out_planes, 1),
+            nn.LeakyReLU(inplace=True)
+        )
+
+    
+    def forward(self, pxo):
+        p, x, o = pxo
+        x_knn, knn_idx = pointops.queryandgroup(
+            self.nsample, p, p, x, None, o, o, use_xyz=True, return_idx=True) # (n, k, 3+c)
+        p_r = x_knn[:, :, 0:3]  # (n, k, 3)
+
+        x = self.aMLPs_1(x_knn)  # (n, k, d)
+        residual = x
+
+        x = x.permute(0, 2, 1)
+        x = self.aMLPs_2(x)  # (n, d_ffn*2, k)
+        u, v = x.chunk(2, dim=1)  # (n, d_ffn, k)
+        # 处理 v
+        v = v.permute(0, 2, 1)
+        v = self.layer_norm(v)
+        v = self.gat(v, p_r)
+        v = self.linear(v)
+        v = v.permute(0, 2, 1)
+        # amlp
+        x_tiny = self.tiny_attn(x)
+        v = v + x_tiny
+        x = u * v
+
+        x = self.aMLPs_3(x)
+        x = x.permute(0, 2, 1)
+        x = residual + x
+        x = rearrange(x, 'n k c -> (n k) c')
+
+        return p, x, o
+    
+
 ##############################################################################################
 
 class SymmetricTransitionUpBlock(nn.Module):
@@ -387,9 +494,8 @@ class PointMixerClsNet(nn.Module):
         self, blocks, 
         c=3, k=40, nsample=[16,16,16,16,16], stride=[1,2,2,2,2],
         planes=[32, 64, 128, 256, 512],
-        share_planes=8,
-        mixerblock='PointMixerBlockPaperInterSetLayerGroupMLPv3',
-        transup='SymmetricTransitionUpBlock',
+        share_planes=2,
+        mixerblock='PointAMLPBlock',
         transdown='SymmetricTransitionDownBlockPaperv3',
         use_avgmax=False,
     ):
@@ -397,7 +503,6 @@ class PointMixerClsNet(nn.Module):
         
         self.c = c
         self.mixerblock = mixerblock
-        self.transup = transup
         self.transdown = transdown
         self.in_planes = c
         self.use_avgmax = use_avgmax
@@ -430,7 +535,7 @@ class PointMixerClsNet(nn.Module):
         self.in_planes = planes
         for _ in range(1, blocks):
             layers.append(globals()[self.mixerblock](
-                self.in_planes, self.in_planes, share_planes, nsample=nsample))
+                self.in_planes, self.in_planes, nsample=nsample, share_planes=share_planes))
         return nn.Sequential(*layers)
 
     def po_from_batched_pcd(self, pcd):
